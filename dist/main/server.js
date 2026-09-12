@@ -1,0 +1,507 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.isServerRunning = isServerRunning;
+exports.getServerPort = getServerPort;
+exports.resolveStaticPage = resolveStaticPage;
+exports.startServer = startServer;
+exports.stopServer = stopServer;
+exports.getLocalIP = getLocalIP;
+exports.getAllLocalIPs = getAllLocalIPs;
+const express_1 = __importDefault(require("express"));
+const cors_1 = __importDefault(require("cors"));
+const ws_1 = require("ws");
+const http = __importStar(require("http"));
+const shutdown_1 = require("./shutdown");
+const os = __importStar(require("os"));
+const path = __importStar(require("path"));
+const fs = __importStar(require("fs"));
+const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
+const routes_1 = require("./routes");
+const auth_1 = require("./routes/auth");
+const db_1 = require("./db");
+const kds_1 = require("./services/kds");
+const express_rate_limit_1 = __importDefault(require("express-rate-limit"));
+const security_1 = require("./middleware/security");
+const whatsapp_1 = require("./services/whatsapp");
+const http_limits_1 = require("./http-limits");
+const csp_1 = require("./csp");
+const path_containment_1 = require("./lib/path-containment");
+let server = null;
+let app;
+let wss = null;
+let stopPromise = null;
+let startReject = null;
+let stopping = false;
+const PORT = parseInt(process.env.PORT || '3001', 10);
+let activePort = PORT;
+/**
+ * JWT verification middleware. Skips health check and auth routes (those
+ * verify tokens individually). Protects all resource routes from unauthenticated
+ * LAN access.
+ */
+function requireAuth(req, res, next) {
+    // Only protect API routes — static files and SPA fallback must pass through
+    if (!req.path.startsWith('/api')) {
+        next();
+        return;
+    }
+    // Health check — unauthenticated
+    if (req.path === '/api/health') {
+        next();
+        return;
+    }
+    // Auth routes handle their own token verification
+    if (req.path.startsWith('/api/auth')) {
+        next();
+        return;
+    }
+    // Allow unauthenticated GET requests for product images (so <img> tags work)
+    if (req.path.startsWith('/api/products/') && req.path.endsWith('/image') && req.method === 'GET') {
+        next();
+        return;
+    }
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) {
+        res.status(401).json({ error: 'Authentication required' });
+        return;
+    }
+    try {
+        const token = authHeader.split(' ')[1];
+        if ((0, security_1.isTokenRevoked)(token)) {
+            res.status(401).json({ error: 'Invalid or expired token' });
+            return;
+        }
+        const decoded = jsonwebtoken_1.default.verify(token, (0, auth_1.getJWTSecret)());
+        // Reject tokens for users deactivated (or deleted) since the token was
+        // issued, instead of trusting the JWT's signature/expiry alone (vuln-0001).
+        const freshKdsAuth = req.path.startsWith('/api/kds')
+            || req.path.startsWith('/api/kitchen')
+            || req.path.startsWith('/api/order-items');
+        const status = (0, security_1.getUserAuthStatus)(decoded.userId, { fresh: freshKdsAuth });
+        if (!status || !status.isActive) {
+            res.status(401).json({ error: 'Invalid or expired token' });
+            return;
+        }
+        // Reject tokens issued before the user's password/PIN was last changed (#173).
+        if ((0, security_1.isTokenStale)(decoded.iat, status.tokensValidAfter)) {
+            res.status(401).json({ error: 'Invalid or expired token' });
+            return;
+        }
+        // Use the DB's current role rather than the JWT's role claim, so a role
+        // change takes effect without waiting for the token to expire.
+        req.user = { ...decoded, role: status.role };
+        next();
+    }
+    catch {
+        res.status(401).json({ error: 'Invalid or expired token' });
+    }
+}
+function isServerRunning() {
+    return server !== null;
+}
+function getServerPort() {
+    return activePort;
+}
+/**
+ * Locate the Next.js static export directory.
+ *
+ * Dev build  → <repo-root>/frontend/out
+ * Packaged   → <resourcesPath>/frontend-out   (see electron-builder extraResources)
+ */
+function getFrontendDir() {
+    const candidates = [
+        // Development / unpackaged: relative to dist/main/ (compiled output of
+        // main/, see tsconfig rootDir covering shared/ since #441)
+        path.join(__dirname, '../../frontend/out'),
+        // Packaged: electron-builder copies it to resources/frontend-out
+        path.join(process.resourcesPath || '', 'frontend-out'),
+    ];
+    for (const dir of candidates) {
+        if (fs.existsSync(path.join(dir, 'index.html'))) {
+            return dir;
+        }
+    }
+    return null;
+}
+/**
+ * Helper to rewrite dotted Next.js static segment file requests to nested paths on Windows.
+ * E.g., /products/__next.!KGRhc2hib2FyZCk.products.__PAGE__.txt -> /products/__next.!KGRhc2hib2FyZCk/products/__PAGE__.txt
+ */
+function rewriteNextExportPath(reqPath) {
+    const nextIndex = reqPath.indexOf('__next.');
+    if (nextIndex === -1)
+        return reqPath;
+    const prefix = reqPath.substring(0, nextIndex + '__next.'.length);
+    const rest = reqPath.substring(nextIndex + '__next.'.length);
+    const lastDotIndex = rest.lastIndexOf('.');
+    if (lastDotIndex === -1)
+        return reqPath;
+    const namePart = rest.substring(0, lastDotIndex);
+    const extPart = rest.substring(lastDotIndex);
+    const rewrittenName = namePart.replace(/\./g, '/');
+    return prefix + rewrittenName + extPart;
+}
+/** Resolve a clean application route to its own Next.js static-export page. */
+function resolveStaticPage(frontendDir, reqPath) {
+    const route = reqPath.replace(/^\/+|\/+$/g, '');
+    if (!route)
+        return path.join(frontendDir, 'index.html');
+    // Static app routes contain only path-safe segments. Unknown or suspicious
+    // paths fall back to the root page without ever escaping frontendDir.
+    if (!/^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(route)) {
+        return path.join(frontendDir, 'index.html');
+    }
+    const candidate = (0, path_containment_1.resolveContainedPath)(frontendDir, route, 'index.html');
+    if (!candidate)
+        return path.join(frontendDir, 'index.html');
+    return fs.existsSync(candidate) ? candidate : path.join(frontendDir, 'index.html');
+}
+function startServer() {
+    stopPromise = null;
+    stopping = false;
+    return new Promise((resolve, reject) => {
+        startReject = reject;
+        app = (0, express_1.default)();
+        app.use((0, cors_1.default)(security_1.corsOptions));
+        app.use(express_1.default.json({ limit: http_limits_1.API_JSON_BODY_LIMIT }));
+        app.use((error, _req, res, next) => {
+            if (error?.type === 'entity.too.large') {
+                res.status(413).json({
+                    error: `Request body is too large. JSON imports are limited to ${http_limits_1.API_JSON_BODY_LIMIT}; use Backup/Restore for full database migration.`,
+                });
+                return;
+            }
+            next(error);
+        });
+        // body-parser 2.x (bundled with Express 5) leaves req.body undefined
+        // instead of {} when a request has no parseable body -- restore the
+        // old default so route handlers can destructure req.body directly.
+        app.use((req, _res, next) => {
+            if (req.body === undefined)
+                req.body = {};
+            next();
+        });
+        app.use(db_1.databaseMaintenanceMiddleware);
+        // ── Global API rate limiting ───────────────────────────────────────
+        // Keep this at the API boundary so every authenticated route, including
+        // routes mounted from separate routers, receives the same protection.
+        // Use express-rate-limit directly so static analysis recognizes the
+        // middleware when reviewing route handlers.
+        app.use('/api', (0, express_rate_limit_1.default)({
+            windowMs: 60 * 1000,
+            limit: 100,
+            standardHeaders: true,
+            legacyHeaders: false,
+            // See staticRouteRateLimit (middleware/security.ts): `X-Forwarded-For`
+            // may arrive via a reverse proxy, but proxy headers are never trusted
+            // for rate-limit bucketing, so disable the XFF validation that would
+            // otherwise throw when `trust proxy` is false.
+            validate: { xForwardedForHeader: false },
+            skip: (req) => (0, security_1.isAllowedPrivateIp)(req.ip || req.socket.remoteAddress || ''),
+        }));
+        // ── Content Security Policy ────────────────────────────────────────
+        // Blocks eval() and remote code. 'unsafe-inline' is required for
+        // Next.js RSC hydration scripts and Tailwind-generated style tags.
+        app.use((req, res, next) => {
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+            res.setHeader('Content-Security-Policy', (0, csp_1.buildCspHeader)(req));
+            next();
+        });
+        // ── Auth middleware (skips /api/health and /api/auth) ─────────────
+        app.use(requireAuth);
+        // ── API health check ───────────────────────────────────────────────
+        app.get('/api/health', (_req, res) => {
+            const db = (0, db_1.getDbHealth)();
+            res.status(db.ok ? 200 : 503).json({
+                status: db.ok ? 'ok' : 'error',
+                db: db.ok ? 'ok' : db.error,
+                service: 'Flo Local API',
+                version: process.env.npm_package_version || '2.4.7',
+                timestamp: new Date().toISOString(),
+            });
+        });
+        //extra
+        // ── Single-domain KDS proxy ────────────────────────────────────────
+        // Only /kds-standalone/* is forwarded to port 3002.
+        // Everything else continues through the normal 3001 server.
+        app.use('/kds-standalone', (req, res) => {
+            const proxyReq = http.request({
+                hostname: '127.0.0.1',
+                port: 3002,
+                path: `/kds-standalone${req.url}`,
+                method: req.method,
+                headers: {
+                    ...req.headers,
+                    host: '127.0.0.1:3002',
+                },
+            }, (proxyRes) => {
+                res.status(proxyRes.statusCode || 502);
+                for (const [key, value] of Object.entries(proxyRes.headers)) {
+                    if (value !== undefined) {
+                        res.setHeader(key, value);
+                    }
+                }
+                proxyRes.pipe(res);
+            });
+            proxyReq.on('error', (err) => {
+                console.error('[KDS Proxy]', err);
+                if (!res.headersSent) {
+                    res.status(502).send('KDS unavailable');
+                }
+            });
+            req.pipe(proxyReq);
+        });
+        // ── All API routes ─────────────────────────────────────────────────
+        (0, routes_1.registerRoutes)(app);
+        // ── Serve Next.js static export ────────────────────────────────────
+        // Must come AFTER API routes so /api/* is not caught by the SPA fallback.
+        const frontendDir = getFrontendDir();
+        if (frontendDir) {
+            console.log(`[Server] Serving frontend from: ${frontendDir}`);
+            // Middleware to patch Windows-specific Next.js static export path nesting.
+            // On Windows, the Next.js static export uses dotted segments (e.g.
+            // __next.!KGRhc2hib2FyZCk.products.__PAGE__.txt) instead of nested
+            // directories. This rewrite is only needed when the app runs on Windows.
+            if (process.platform === 'win32') {
+                app.use((0, security_1.staticRouteRateLimit)(), (req, res, next) => {
+                    if (req.path.includes('__next.')) {
+                        const originalPath = req.path;
+                        const rewritten = rewriteNextExportPath(originalPath);
+                        if (rewritten !== originalPath) {
+                            const fullPath = (0, path_containment_1.resolveContainedPath)(frontendDir, rewritten);
+                            if (fullPath && fs.existsSync(fullPath)) {
+                                req.url = rewritten;
+                            }
+                        }
+                    }
+                    next();
+                });
+            }
+            app.use(express_1.default.static(frontendDir, { dotfiles: 'allow', index: false }));
+            // Serve each Next.js static route's own index. Returning the root export
+            // for /whatsapp (or any direct link/refresh) runs app/page.tsx and sends
+            // the user to Dashboard instead of the requested page.
+            app.get(/^(?!\/api|\/kds).*$/, (0, security_1.staticRouteRateLimit)(), (req, res) => {
+                res.sendFile(resolveStaticPage(frontendDir, req.path), { dotfiles: 'allow' });
+            });
+        }
+        else {
+            console.warn('[Server] Frontend build not found. Run `npm run build:frontend` first.');
+            app.get('/', (_req, res) => {
+                res.send(`
+          <html><body style="font-family:sans-serif;padding:2rem">
+            <h2>Flo – Frontend not built</h2>
+            <p>Run <code>npm run build:frontend</code> then restart the app.</p>
+          </body></html>
+        `);
+            });
+        }
+        // ── Global error handler ───────────────────────────────────────────
+        app.use((err, _req, res, _next) => {
+            if (err.type === 'entity.parse.failed') {
+                return res.status(400).json({ error: 'Malformed JSON request body' });
+            }
+            const status = typeof err.status === 'number' && err.status >= 400 && err.status < 500
+                ? err.status
+                : 500;
+            if (status >= 500)
+                console.error('[Server] Error:', err);
+            res.status(status).json({ error: status >= 500 ? 'Internal server error' : (err.message || 'Client error') });
+        });
+        const basePort = parseInt(process.env.PORT || '3001', 10);
+        let currentPort = basePort;
+        let attempts = 0;
+        const listeningServer = http.createServer(app);
+        server = listeningServer;
+        (0, shutdown_1.installHttpShutdownTracking)(listeningServer);
+        const tryListen = () => {
+            const attemptedPort = currentPort;
+            const onListening = () => {
+                if (stopping) {
+                    try {
+                        listeningServer.close();
+                    }
+                    catch {
+                        return;
+                    }
+                    return;
+                }
+                startReject = null;
+                listeningServer.off('error', onError);
+                const address = listeningServer.address();
+                activePort = address && typeof address !== 'string' ? address.port : attemptedPort;
+                console.log(`[Server] HTTP server running on http://localhost:${activePort}`);
+                if (listeningServer) {
+                    // noServer + a manual 'upgrade' handler (rather than passing `server`
+                    // straight to WebSocketServer) so a disabled KDS can 404 the upgrade
+                    // instead of completing it — checked fresh on every request since
+                    // kds_enabled can change at runtime without a restart (issue #133).
+                    const websocketServer = new ws_1.WebSocketServer({ noServer: true });
+                    wss = websocketServer;
+                    (0, kds_1.setupKdsWebSocket)(websocketServer);
+                    listeningServer.on('upgrade', (request, socket, head) => {
+                        const pathname = (request.url || '').split('?')[0];
+                        if (pathname !== '/kds') {
+                            socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+                            socket.destroy();
+                            return;
+                        }
+                        if ((0, db_1.isDatabaseMaintenanceActive)()) {
+                            socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+                            socket.destroy();
+                            return;
+                        }
+                        if (!(0, db_1.isKdsEnabled)()) {
+                            // Pretend the endpoint doesn't exist rather than confirming it's
+                            // just disabled — less to probe from a stale/misconfigured KDS
+                            // device on the LAN (issue #133).
+                            socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+                            socket.destroy();
+                            return;
+                        }
+                        try {
+                            websocketServer.handleUpgrade(request, socket, head, (ws) => {
+                                websocketServer.emit('connection', ws, request);
+                            });
+                        }
+                        catch (error) {
+                            console.error('[Server] KDS WebSocket upgrade failed:', error);
+                            socket.destroy();
+                        }
+                    });
+                    console.log(`[Server] KDS WebSocket running on ws://localhost:${activePort}/kds`);
+                }
+                // main/index.ts (Electron) also calls this; dev-server and pm2 boot
+                // through here instead and would otherwise start with module defaults.
+                try {
+                    (0, whatsapp_1.initFromDb)();
+                }
+                catch (error) {
+                    console.error('[Server] WhatsApp startup initialization failed:', error);
+                }
+                resolve();
+            };
+            const onError = (err) => {
+                if (stopping)
+                    return;
+                listeningServer.off('listening', onListening);
+                if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
+                    attempts++;
+                    if (attempts >= 10) {
+                        const errorMsg = `[Server] Failed to bind to any port after 10 attempts starting from ${basePort}`;
+                        console.error(errorMsg);
+                        reject(new Error(errorMsg));
+                        return;
+                    }
+                    currentPort++;
+                    console.log(`[Server] Port ${attemptedPort} in use (${err.code}), trying ${currentPort}`);
+                    tryListen();
+                    return;
+                }
+                reject(err);
+            };
+            listeningServer.once('listening', onListening);
+            listeningServer.once('error', onError);
+            listeningServer.listen(attemptedPort, '0.0.0.0');
+        };
+        tryListen();
+    });
+}
+function stopServer() {
+    if (stopPromise)
+        return stopPromise;
+    stopping = true;
+    const rejectStart = startReject;
+    startReject = null;
+    rejectStart?.((0, shutdown_1.createShutdownCancellationError)('Main server'));
+    const serverToClose = server;
+    const wssToClose = wss;
+    // Mark resources unavailable immediately. Repeated callers share the same
+    // promise while the captured resources finish draining.
+    server = null;
+    wss = null;
+    stopPromise = (0, shutdown_1.closeServerResources)(serverToClose, wssToClose, 'Main server')
+        .then(() => {
+        console.log('[Server] HTTP/WebSocket server stopped');
+    });
+    return stopPromise;
+}
+/** Helper to check if an IPv4 address is active and valid (excludes loopback & 169.254.x.x link-local APIPA). */
+function isValidLocalIPv4(alias) {
+    const isIPv4 = alias.family === 'IPv4' || alias.family === 4;
+    if (!isIPv4 || alias.internal)
+        return false;
+    const ip = alias.address;
+    if (ip.startsWith('169.254.') || ip.startsWith('127.') || ip === '0.0.0.0') {
+        return false;
+    }
+    return true;
+}
+/** Returns the first valid non-loopback IPv4 address on the machine. */
+function getLocalIP() {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        const iface = interfaces[name];
+        if (!iface)
+            continue;
+        for (const alias of iface) {
+            if (isValidLocalIPv4(alias)) {
+                return alias.address;
+            }
+        }
+    }
+    return '127.0.0.1';
+}
+/** Returns all valid non-loopback IPv4 addresses on the machine. */
+function getAllLocalIPs() {
+    const ips = [];
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        const iface = interfaces[name];
+        if (!iface)
+            continue;
+        for (const alias of iface) {
+            if (isValidLocalIPv4(alias)) {
+                ips.push(alias.address);
+            }
+        }
+    }
+    return ips.length > 0 ? ips : ['127.0.0.1'];
+}
+//# sourceMappingURL=server.js.map

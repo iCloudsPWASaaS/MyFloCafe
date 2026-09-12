@@ -1,0 +1,1 @@
+{"version":3,"file":"receipt.d.ts","sourceRoot":"","sources":["../../../main/services/receipt.ts"],"names":[],"mappings":"AAAA;;;;;GAKG;AAIH,MAAM,MAAM,SAAS,GAAG,SAAS,GAAG,SAAS,CAAC;AAE9C,wBAAsB,YAAY,CAChC,MAAM,EAAE,MAAM,EACd,MAAM,EAAE,MAAM,EACd,SAAS,EAAE,SAAS,GACnB,OAAO,CAAC;IAAE,OAAO,EAAE,OAAO,CAAC;IAAC,UAAU,CAAC,EAAE,MAAM,CAAA;CAAE,CAAC,CAsBpD"}

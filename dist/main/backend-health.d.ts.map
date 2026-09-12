@@ -1,0 +1,1 @@
+{"version":3,"file":"backend-health.d.ts","sourceRoot":"","sources":["../../main/backend-health.ts"],"names":[],"mappings":"AAAA,MAAM,WAAW,YAAY;IAC3B,MAAM,EAAE,MAAM,CAAC;IACf,GAAG,EAAE,MAAM,CAAC;IACZ,SAAS,EAAE,MAAM,CAAC;CACnB;AAED;;;;;;GAMG;AACH,wBAAsB,kBAAkB,CAAC,KAAK,EAAE,YAAY,EAAE,SAAS,SAAO,GAAG,OAAO,CAAC,OAAO,CAAC,CAehG"}

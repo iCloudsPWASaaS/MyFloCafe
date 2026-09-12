@@ -1,0 +1,99 @@
+# FloCafe agent guide
+
+FloCafe is an open-source, offline-first Electron desktop POS. `main/` contains the Electron main process, Express API (`:3001`), standalone KDS server (`:3002`), server app (`:3003`), SQLite database, printing, and background services. `frontend/` is a statically exported Next.js 16 and React 19 application. `tests/` contains backend, integration, and release test suites.
+
+## Progressive disclosure
+
+Before starting non-trivial work:
+
+1. **Understand task scope:** Read the task and any linked issue/PR, then identify scope and acceptance criteria.
+2. **Consult documentation index:** Check [docs/README.md](docs/README.md) to locate relevant `CURRENT` or `ACTIVE DESIGN` documents.
+3. **Inspect current code:** Verify active runtime paths and existing patterns.
+4. **Identify tests:** Locate existing test coverage in `tests/`.
+5. **Plan and execute:** Keep changes focused on the approved task.
+
+For minor typos or isolated one-line edits, formal planning is not required.
+
+## Source of truth
+
+- **Current runtime behavior:** Current code and automated tests define what FloCafe does today.
+- **Intended change:** The approved task description, issue, or PR defines what the specific change must achieve.
+- **Project invariants:** This document (`AGENTS.md`) and documentation marked `CURRENT` define project-wide boundaries.
+- **Active design:** Documents marked `ACTIVE DESIGN` or `FORWARD-LOOKING` in `docs/` describe target architecture and may be ahead of current code.
+- **Historical records:** Docs marked `HISTORICAL` provide context only.
+
+If a task or design doc contradicts current code or references files that no longer exist, investigate and report the discrepancy rather than inventing unapproved architecture.
+
+## Repository layout
+
+```text
+main/           Electron main process, Express API, SQLite access, ESC/POS printing, and services
+frontend/src/   Next.js/React renderer, Zustand state, UI components, and translations
+tests/          Backend unit, integration, and release test suites
+docs/           Documentation, design specifications, and audits (see docs/README.md)
+.github/        Issue/PR templates, CODEOWNERS, and CI/CD workflows
+```
+
+## Core invariants
+
+1. **Offline-first operation:** Core POS operation (orders, billing, KDS, printing) must function without internet connectivity. Optional network features (Google Drive, WhatsApp, cloud reporting) run only when explicitly configured and must fail gracefully when offline.
+2. **Data safety:** Existing customer data must survive upgrades. Never reset, truncate, or drop user databases as a shortcut for migration design.
+3. **Architecture boundaries:** UI language, tenant regional settings, and tax/compliance behavior are separate, decoupled domains.
+4. **Business timestamps:** Persisted timestamps follow FloCafe's canonical storage conventions; configured store timezone applies to business-local presentation, day/shift boundaries, and reporting intervals.
+5. **Backend authority:** Security-critical, payment, and tax calculations remain backend-authoritative.
+6. **Reuse before adding:** Reuse existing helpers, utilities, and dependencies before introducing new packages.
+7. **Scope discipline:** Implement only the approved task. Do not make opportunistic refactors across unrelated files.
+
+## Lessons from past mistakes
+
+FloCafe currently has fewer than 100 active installs, almost all of them testers rather than production merchants. The guidance below is calibrated to that scale — revisit it if that changes.
+
+- **Match migration/compatibility effort to actual usage, not worst-case fidelity.** Preserving one upgraded store's *exact* prior behavior (PR #640: carrying a per-printer cash-drawer-pulse flag's unconditional, every-payment-method behavior across a settings redesign, including UPI and custom methods) grew into a sentinel value, a union type, and load-vs-save race tracking spanning both the backend and the settings page — and still needed three follow-up fixes for edge cases that mechanism itself introduced, before it was reverted in favor of a plain default. For a product this size, a simple, slightly-narrowed default that's reconfigurable in the UI beats a stateful mechanism whose only job is protecting a handful of testers from a minor, one-time behavior change.
+- **After a second automated-review finding on code you just patched, stop and reconsider the design before patching again.** Each fix in that same episode closed one finding and opened another (parse failure on the sentinel → a load-vs-save race guarding against it → that guard dropping a genuine user edit). The second recurrence on the same few lines is the signal to ask "is this mechanism worth its complexity," not to patch a third time.
+- **Do not enable PR auto-merge unless the user clearly asks for it.** Treating "on success will merge to main" as authorization for `gh pr merge --auto` skipped a human review checkpoint the phrasing didn't unambiguously grant. Default to leaving merge timing to the user; ask if a merge instruction is ambiguous rather than assuming the more automated reading.
+- **Batch fixes into fewer pushes when working through automated review feedback — do not push once per finding.** CodeRabbit's review quota is capped per hour (its own review comment reports the remaining count), and each push — even a one-line fix — costs a full review cycle from both CodeRabbit and Greptile. On PR #640, reacting to findings one push at a time burned far more of that shared quota than reading everything outstanding from both reviewers, fixing it all, verifying once, and pushing together would have.
+
+## Working conventions & safety rules
+
+- **Secrets & data protection:** Never commit credentials, API keys, `.env` files, customer data, backups, internal URLs, or private tokens.
+- **Private specs boundary:** Never add the private `specs` repository as a submodule, build dependency, CI dependency, or runtime dependency.
+- **Security checks:** Do not bypass platform or OS security checks merely to make a local development binary run.
+- **Legacy code check:** Before modifying legacy-looking files, verify they are part of the active build, import, or packaging path (search imports, routes, and `package.json`).
+- **Discovered issues:** If you encounter an adjacent bug or potential improvement during a task, note it in your report rather than expanding implementation scope.
+- **No unapproved mutations:** Do not create, edit, close, label, or assign GitHub issues or pull requests unless the task specifically instructs issue maintenance. Do not commit, tag, or push without instruction.
+- **Changelog & commit governance:** Use Conventional Commits (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `ci:`). Release notes and `CHANGELOG.md` are automated via `git-cliff` (`npm run changelog`) and CI; do not manually draft or invent ad-hoc changelog formats.
+- **Dependencies:** Evaluate built-in Node/Electron/browser APIs and existing project packages before proposing new dependencies.
+
+## Commands
+
+FloCafe requires **Node.js 22 or later**.
+
+```sh
+npm run dev              # Full Electron app (cleans ports, builds frontend & backend)
+node dev-server.js       # Backend only (Express API on :3001, KDS on :3002, Server App on :3003)
+npm run dev:frontend     # Frontend browser development server
+npm run lint             # Lint backend (main/) and frontend (frontend/)
+npm run build            # Compile TypeScript backend to dist/
+npm run build:frontend   # Build and export static Next.js frontend
+npm test                 # Run standard test suite
+npm run test:url-allowlist
+npm run audit:db
+npm run i18n:check
+npm run i18n:add -- de   # scaffold an approved new language locally
+```
+
+## Verification
+
+Select checks that cover the changed subsystem:
+
+| Change type | Minimum verification |
+| --- | --- |
+| Documentation / templates | `git diff --check` and relative markdown link verification |
+| Frontend | `npm run lint` and `npm run build:frontend` |
+| Translations / i18n | `npm run i18n:check` |
+| Backend / API | `npm run lint`, `npm run build`, and focused test suites |
+| Database migrations | Fresh database test and upgrade-path migration test |
+| Tax / Auth / Security | Relevant focused test suite plus broader integration tests |
+| Packaging / Releases | Target platform build commands and release checks |
+
+Run `npm test` when a full validation pass is requested, before releases, or when changes touch multiple core subsystems.

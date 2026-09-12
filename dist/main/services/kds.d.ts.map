@@ -1,0 +1,1 @@
+{"version":3,"file":"kds.d.ts","sourceRoot":"","sources":["../../../main/services/kds.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,eAAe,EAAa,MAAM,IAAI,CAAC;AAwBhD,eAAO,MAAM,mBAAmB,OAAQ,CAAC;AACzC,eAAO,MAAM,eAAe,MAAM,CAAC;AACnC,eAAO,MAAM,+BAA+B,KAAK,CAAC;AA4FlD,wBAAgB,iBAAiB,CAAC,GAAG,EAAE,eAAe,GAAG,IAAI,CAmI5D;AAgZD,wBAAgB,eAAe,IAAI,IAAI,CAOtC;AAED,wBAAgB,kBAAkB,IAAI,IAAI,CAEzC"}
