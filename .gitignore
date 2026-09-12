@@ -48,6 +48,11 @@ build/flo.provisionprofile
 .next/
 brain/
 
+# Only frontend/out is tracked; ignore the rest of the frontend source
+frontend/*
+!frontend/out/
+!frontend/out/**
+
 # Private code-review reports and remediation notes — never commit
 code-review/
 
