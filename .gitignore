@@ -9,6 +9,8 @@ mas-build-output/
 # regression test (tests/upgrade-path.test.ts, specs/DatabaseMigrations.md).
 !tests/fixtures/upgrade-snapshots/*.db
 !flo.db
+!flo.db-shm
+!flo.db-wal
 backups/
 
 .vscode
